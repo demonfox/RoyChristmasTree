@@ -1,0 +1,7 @@
+{
+  "name": "LuxeHoliday3D",
+  "description": "A luxury interactive 3D particle Christmas experience controlled by hand gestures.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

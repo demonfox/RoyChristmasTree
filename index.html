@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Luxury Interactive Christmas Tree</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700&family=Lato:wght@300;400&display=swap" rel="stylesheet">
+    
+    <!-- Custom Styles -->
+    <style>
+      body { margin: 0; padding: 0; background-color: #020402; overflow: hidden; }
+      ::-webkit-scrollbar { width: 6px; }
+      ::-webkit-scrollbar-track { background: #020402; }
+      ::-webkit-scrollbar-thumb { background: #d4af37; border-radius: 3px; }
+      .blur-xs { filter: blur(0.5px); }
+    </style>
+
+    <!-- Import Map -->
+    <script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.2.0",
+    "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+    "three": "https://esm.sh/three@0.155.0",
+    "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.15.12?deps=three@0.155.0,react@18.2.0,react-dom@18.2.0",
+    "@react-three/drei": "https://esm.sh/@react-three/drei@9.96.1?deps=three@0.155.0,react@18.2.0,react-dom@18.2.0,@react-three/fiber@8.15.12",
+    "@react-three/postprocessing": "https://esm.sh/@react-three/postprocessing@2.16.0?deps=three@0.155.0,react@18.2.0,react-dom@18.2.0,@react-three/fiber@8.15.12",
+    "@mediapipe/tasks-vision": "https://esm.sh/@mediapipe/tasks-vision@0.10.9",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
+    "react/": "https://esm.sh/react@^19.2.3/"
+  }
+}
+</script>
+
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link rel="stylesheet" href="/index.css">
+</head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+      import React, { useRef, useMemo, useEffect, useState, useCallback } from 'react';
+      import ReactDOM from 'react-dom/client';
+      import * as THREE from 'three';
+      import { Canvas, useFrame } from '@react-three/fiber';
+      import { OrbitControls, PerspectiveCamera } from '@react-three/drei';
+      import { EffectComposer, Bloom, Vignette } from '@react-three/postprocessing';
+      import { FilesetResolver, GestureRecognizer } from '@mediapipe/tasks-vision';
+
+      // --- TYPES & CONSTANTS ---
+      const ParticleMode = {
+        TREE: 'TREE',
+        EXPLODE: 'EXPLODE',
+        IMAGE: 'IMAGE'
+      };
+
+      const PARTICLE_COUNT = 15000;
+      const ANIMATION_SPEED = 0.08;
+
+      // --- VISION SERVICE ---
+      class VisionService {
+        constructor() {
+          this.gestureRecognizer = null;
+          this.video = null;
+          this.lastVideoTime = -1;
+          this.animationFrameId = null;
+          this.runningMode = "VIDEO";
+        }
+        
+        async initialize() {
+          if (this.gestureRecognizer) return;
+
+          try {
+            const vision = await FilesetResolver.forVisionTasks(
+              "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.9/wasm"
+            );
+            
+            this.gestureRecognizer = await GestureRecognizer.createFromOptions(vision, {
+              baseOptions: {
+                modelAssetPath:
+                  "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task",
+                delegate: "GPU",
+              },
+              runningMode: this.runningMode,
+              numHands: 1
+            });
+          } catch (error) {
+            console.error("Failed to load MediaPipe:", error);
+            // Don't throw here to prevent app crash if offline, just log
+          }
+        }
+
+        startPrediction(videoElement, onResult) {
+          this.video = videoElement;
+
+          const predict = async () => {
+            if (!this.gestureRecognizer || !this.video) return;
+
+            if (this.video.currentTime !== this.lastVideoTime) {
+              this.lastVideoTime = this.video.currentTime;
+              
+              try {
+                const results = this.gestureRecognizer.recognizeForVideo(this.video, Date.now());
+                
+                let gestureName = "None";
+                let isPinching = false;
+
+                if (results.gestures.length > 0) {
+                  gestureName = results.gestures[0][0].categoryName;
+                  
+                  if (results.landmarks && results.landmarks.length > 0) {
+                    const landmarks = results.landmarks[0];
+                    const thumbTip = landmarks[4];
+                    const indexTip = landmarks[8];
+                    
+                    if (thumbTip && indexTip) {
+                      const distance = Math.sqrt(
+                        Math.pow(thumbTip.x - indexTip.x, 2) + 
+                        Math.pow(thumbTip.y - indexTip.y, 2)
+                      );
+                      if (distance < 0.05) {
+                        isPinching = true;
+                      }
+                    }
+                  }
+                }
+
+                onResult(gestureName, isPinching);
+
+              } catch (e) {
+                console.warn("Prediction error:", e);
+              }
+            }
+            this.animationFrameId = requestAnimationFrame(predict);
+          };
+
+          predict();
+        }
+
+        stop() {
+          if (this.animationFrameId) {
+            cancelAnimationFrame(this.animationFrameId);
+          }
+        }
+      }
+
+      const visionService = new VisionService();
+
+      // --- VISUALIZER COMPONENTS ---
+      const Particles = ({ mode, imageFile }) => {
+        const pointsRef = useRef(null);
+        
+        const targets = useRef(new Float32Array(PARTICLE_COUNT * 3));
+        const currentPositions = useRef(new Float32Array(PARTICLE_COUNT * 3));
+        
+        const treePositions = useMemo(() => {
+          const arr = new Float32Array(PARTICLE_COUNT * 3);
+          for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const i3 = i * 3;
+            const y = Math.random() * 20 - 10; 
+            const radius = (10 - y) * 0.4 * Math.random(); 
+            const angle = i * 0.1 + y * 2; 
+            
+            arr[i3] = Math.cos(angle) * radius;
+            arr[i3 + 1] = y;
+            arr[i3 + 2] = Math.sin(angle) * radius;
+          }
+          return arr;
+        }, []);
+
+        const explodePositions = useMemo(() => {
+          const arr = new Float32Array(PARTICLE_COUNT * 3);
+          for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const i3 = i * 3;
+            const theta = Math.random() * Math.PI * 2;
+            const phi = Math.acos(Math.random() * 2 - 1);
+            const r = 15 + Math.random() * 25; 
+            
+            arr[i3] = r * Math.sin(phi) * Math.cos(theta);
+            arr[i3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+            arr[i3 + 2] = r * Math.cos(phi);
+          }
+          return arr;
+        }, []);
+
+        const [imagePositions, setImagePositions] = useState(null);
+
+        useEffect(() => {
+          currentPositions.current.set(treePositions);
+          if (pointsRef.current) {
+            pointsRef.current.geometry.attributes.position.needsUpdate = true;
+          }
+        }, [treePositions]);
+
+        useEffect(() => {
+          if (!imageFile) return;
+
+          const img = new Image();
+          const url = URL.createObjectURL(imageFile);
+          img.src = url;
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+
+            const size = 200; 
+            canvas.width = size;
+            canvas.height = size;
+            ctx.drawImage(img, 0, 0, size, size);
+
+            const data = ctx.getImageData(0, 0, size, size).data;
+            const validPixels = [];
+
+            for (let y = 0; y < size; y++) {
+              for (let x = 0; x < size; x++) {
+                const idx = (y * size + x) * 4;
+                const alpha = data[idx + 3];
+                const brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+                
+                if (alpha > 128 && brightness > 30) {
+                  validPixels.push({
+                    x: (x / size) * 14 - 7, 
+                    y: -((y / size) * 14 - 7)
+                  });
+                }
+              }
+            }
+
+            const newPos = new Float32Array(PARTICLE_COUNT * 3);
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+              const i3 = i * 3;
+              if (validPixels.length > 0) {
+                const pixel = validPixels[i % validPixels.length];
+                newPos[i3] = pixel.x;
+                newPos[i3 + 1] = pixel.y;
+                newPos[i3 + 2] = (Math.random() - 0.5) * 1; 
+              } else {
+                newPos[i3] = (Math.random() - 0.5) * 10;
+                newPos[i3 + 1] = (Math.random() - 0.5) * 10;
+                newPos[i3 + 2] = (Math.random() - 0.5) * 10;
+              }
+            }
+            setImagePositions(newPos);
+            URL.revokeObjectURL(url);
+          };
+        }, [imageFile]);
+
+        useEffect(() => {
+          let sourceArr = treePositions;
+          if (mode === ParticleMode.EXPLODE) sourceArr = explodePositions;
+          else if (mode === ParticleMode.IMAGE && imagePositions) sourceArr = imagePositions;
+          else if (mode === ParticleMode.IMAGE && !imagePositions) sourceArr = treePositions; 
+          else if (mode === ParticleMode.TREE) sourceArr = treePositions;
+
+          targets.current.set(sourceArr);
+        }, [mode, imagePositions, treePositions, explodePositions]);
+
+        useFrame(() => {
+          if (!pointsRef.current) return;
+          
+          const positions = pointsRef.current.geometry.attributes.position.array;
+          const target = targets.current;
+
+          for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
+            positions[i] += (target[i] - positions[i]) * ANIMATION_SPEED;
+          }
+          
+          pointsRef.current.geometry.attributes.position.needsUpdate = true;
+          pointsRef.current.rotation.y += 0.001;
+        });
+
+        return (
+          <points ref={pointsRef}>
+            <bufferGeometry>
+              <bufferAttribute
+                attach="attributes-position"
+                count={PARTICLE_COUNT}
+                array={currentPositions.current}
+                itemSize={3}
+              />
+            </bufferGeometry>
+            <pointsMaterial
+              size={0.15}
+              color={mode === ParticleMode.IMAGE ? "#ffaa00" : (mode === ParticleMode.EXPLODE ? "#ffffff" : "#D4AF37")}
+              transparent
+              opacity={0.8}
+              blending={THREE.AdditiveBlending}
+              sizeAttenuation={true}
+            />
+          </points>
+        );
+      };
+
+      const Visualizer = (props) => {
+        return (
+          <div className="w-full h-screen bg-[#020402]">
+            <Canvas dpr={[1, 2]}>
+              <PerspectiveCamera makeDefault position={[0, 0, 25]} fov={50} />
+              <OrbitControls 
+                enablePan={false} 
+                enableZoom={true} 
+                minDistance={10} 
+                maxDistance={50}
+                autoRotate={false}
+              />
+              <ambientLight intensity={0.5} />
+              <Particles {...props} />
+              <EffectComposer disableNormalPass>
+                 <Bloom 
+                   luminanceThreshold={0.2} 
+                   mipmapBlur 
+                   intensity={1.5} 
+                   radius={0.6}
+                 />
+                 <Vignette eskil={false} offset={0.1} darkness={1.1} />
+              </EffectComposer>
+            </Canvas>
+          </div>
+        );
+      };
+
+      // --- UI COMPONENT ---
+      const UI = ({ currentMode, onUpload, videoRef, gesture, isPinching, hasImage }) => {
+        const handleFileChange = (e) => {
+          if (e.target.files && e.target.files[0]) {
+            onUpload(e.target.files[0]);
+          }
+        };
+
+        const getStatusText = () => {
+          if (isPinching && hasImage) return "Mode: IMAGE REVEAL (Pinching)";
+          if (gesture === "Closed_Fist") return "Mode: ASSEMBLE TREE (Fist)";
+          if (gesture === "Open_Palm") return "Mode: EXPLODE (Open Hand)";
+          return "Mode: IDLE (Waiting for gesture)";
+        };
+
+        return (
+          <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-6 z-10 text-[#D4AF37] font-sans">
+            
+            {/* Header */}
+            <header className="flex justify-between items-start">
+              <div>
+                <h1 className="text-4xl font-bold tracking-widest font-['Cinzel'] text-transparent bg-clip-text bg-gradient-to-r from-[#D4AF37] via-[#FFF] to-[#D4AF37] drop-shadow-[0_0_10px_rgba(212,175,55,0.5)]">
+                  LUXE HOLIDAY
+                </h1>
+                <p className="text-emerald-400 text-sm tracking-widest mt-2 uppercase opacity-80">
+                  Interactive 3D Experience
+                </p>
+              </div>
+              
+              {/* Webcam Preview */}
+              <div className="relative group pointer-events-auto">
+                <video 
+                  ref={videoRef} 
+                  className="w-32 h-24 object-cover rounded-lg border-2 border-[#D4AF37]/30 shadow-[0_0_15px_rgba(212,175,55,0.2)]" 
+                  autoPlay 
+                  muted 
+                  playsInline 
+                />
+                <div className="absolute top-0 left-0 w-full h-full bg-black/20 rounded-lg"></div>
+                <div className="absolute bottom-1 right-2 text-[10px] text-white/70">LIVE INPUT</div>
+              </div>
+            </header>
+
+            {/* Center Status */}
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-center">
+               <div className={`transition-all duration-500 ease-out transform ${gesture !== "None" ? 'opacity-100 scale-100' : 'opacity-0 scale-90'}`}>
+                  <h2 className="text-2xl text-emerald-100 font-light tracking-[0.2em] uppercase blur-xs">
+                    {getStatusText()}
+                  </h2>
+               </div>
+            </div>
+
+            {/* Footer / Controls */}
+            <footer className="flex justify-between items-end pointer-events-auto">
+              <div className="bg-black/40 backdrop-blur-md p-4 rounded-xl border border-[#D4AF37]/20 max-w-sm">
+                <h3 className="text-[#D4AF37] font-bold mb-2 tracking-wide border-b border-[#D4AF37]/20 pb-1">INSTRUCTIONS</h3>
+                <ul className="space-y-2 text-sm text-emerald-50">
+                  <li className="flex items-center gap-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#D4AF37]"></span>
+                    <span>✊ <b>Close Fist:</b> Assemble Tree</span>
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#D4AF37]"></span>
+                    <span>✋ <b>Open Hand:</b> Explode Stars</span>
+                  </li>
+                  <li className="flex items-center gap-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#D4AF37]"></span>
+                    <span>🤏 <b>Pinch:</b> Reveal Your Photo</span>
+                  </li>
+                </ul>
+              </div>
+
+              <div className="flex flex-col items-end gap-3">
+                <label className="cursor-pointer group">
+                   <input type="file" accept="image/*" className="hidden" onChange={handleFileChange} />
+                   <div className="px-6 py-3 bg-gradient-to-r from-[#046307] to-[#0a4f0c] text-[#D4AF37] border border-[#D4AF37]/50 rounded-full font-bold tracking-wider shadow-lg hover:shadow-[0_0_20px_rgba(212,175,55,0.4)] transition-all transform group-hover:-translate-y-1 flex items-center gap-2">
+                     <span>UPLOAD PHOTO</span>
+                     <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                     </svg>
+                   </div>
+                </label>
+                {!hasImage && <p className="text-xs text-red-400 mr-2">Upload a photo to use Pinch mode</p>}
+              </div>
+            </footer>
+          </div>
+        );
+      };
+
+      // --- APP COMPONENT ---
+      const App = () => {
+        const [mode, setMode] = useState(ParticleMode.TREE);
+        const [imageFile, setImageFile] = useState(null);
+        const [gesture, setGesture] = useState("None");
+        const [isPinching, setIsPinching] = useState(false);
+        
+        const videoRef = useRef(null);
+        const initialized = useRef(false);
+
+        useEffect(() => {
+          if (initialized.current) return;
+          initialized.current = true;
+
+          const startCamera = async () => {
+            if (!videoRef.current) return;
+            try {
+              await visionService.initialize();
+              
+              const stream = await navigator.mediaDevices.getUserMedia({ 
+                video: { width: 640, height: 480 } 
+              });
+              
+              videoRef.current.srcObject = stream;
+              videoRef.current.onloadeddata = () => {
+                visionService.startPrediction(videoRef.current, (detectedGesture, pinchState) => {
+                  setGesture(detectedGesture);
+                  setIsPinching(pinchState);
+                });
+              };
+            } catch (err) {
+              console.error("Camera/Vision init failed:", err);
+            }
+          };
+
+          startCamera();
+
+          return () => {
+            visionService.stop();
+          };
+        }, []);
+
+        useEffect(() => {
+          if (isPinching && imageFile) {
+            setMode(ParticleMode.IMAGE);
+          } else if (gesture === "Open_Palm") {
+            setMode(ParticleMode.EXPLODE);
+          } else if (gesture === "Closed_Fist") {
+            setMode(ParticleMode.TREE);
+          }
+          else if (!isPinching && mode === ParticleMode.IMAGE) {
+            setMode(ParticleMode.TREE);
+          }
+        }, [gesture, isPinching, imageFile, mode]);
+
+        const handleUpload = useCallback((file) => {
+          setImageFile(file);
+          setMode(ParticleMode.IMAGE);
+          setTimeout(() => {
+              if (!isPinching) setMode(ParticleMode.TREE);
+          }, 1500);
+        }, [isPinching]);
+
+        return (
+          <div className="relative w-full h-full overflow-hidden">
+            <Visualizer mode={mode} imageFile={imageFile} />
+            <UI 
+              currentMode={mode} 
+              onUpload={handleUpload} 
+              videoRef={videoRef}
+              gesture={gesture}
+              isPinching={isPinching}
+              hasImage={!!imageFile}
+            />
+          </div>
+        );
+      };
+
+      // --- MOUNT ---
+      const rootElement = document.getElementById('root');
+      const root = ReactDOM.createRoot(rootElement);
+      root.render(<App />);
+    </script>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>
